@@ -19,9 +19,12 @@ Environment:
 #include <suppress.h>
 
 
+#define MAX_FILE_PATH_LENGTH 265
+
 NTSTATUS MiniUnload(FLT_FILTER_UNLOAD_FLAGS);
 FLT_PREOP_CALLBACK_STATUS SssPreCreate(PFLT_CALLBACK_DATA, PCFLT_RELATED_OBJECTS, PVOID*);
 FLT_PREOP_CALLBACK_STATUS SssPreRead(PFLT_CALLBACK_DATA, PCFLT_RELATED_OBJECTS, PVOID*);
+FLT_PREOP_CALLBACK_STATUS SssPreReadSimple(PFLT_CALLBACK_DATA, PCFLT_RELATED_OBJECTS, PVOID*);
 FLT_PREOP_CALLBACK_STATUS SssPreWrite(PFLT_CALLBACK_DATA, PCFLT_RELATED_OBJECTS, PVOID*);
 FLT_POSTOP_CALLBACK_STATUS SssPostCreate(PFLT_CALLBACK_DATA, PCFLT_RELATED_OBJECTS, PVOID*, FLT_POST_OPERATION_FLAGS);
 
@@ -29,8 +32,9 @@ PFLT_FILTER FilterHandle = NULL;
 
 const FLT_OPERATION_REGISTRATION Callbacks[] = {
 	// {IRP_MJ_CREATE, 0, SssPreCreate, SssPostCreate},
-	{IRP_MJ_READ, 0, SssPreRead, NULL},  // use NULL if we do not want to register a callback
-	{IRP_MJ_WRITE, 0, SssPreWrite, NULL},  // use NULL if we do not want to register a callback
+	// {IRP_MJ_READ, 0, SssPreRead, NULL},  // use NULL if we do not want to register a callback
+	{IRP_MJ_READ, 0, SssPreRead, NULL},
+	// {IRP_MJ_WRITE, 0, SssPreWrite, NULL},  // use NULL if we do not want to register a callback
 	{IRP_MJ_OPERATION_END}  // this is always the last member so that windows knows that this is end of the structure array
 };
 
@@ -95,16 +99,96 @@ NTSTATUS MiniUnload(FLT_FILTER_UNLOAD_FLAGS Flags) {
 	return STATUS_SUCCESS;
 }
 
-/*NTSTATUS MGetFileName(PFLT_CALLBACK_DATA Data) {
+NTSTATUS MGetFileName(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PUNICODE_STRING FinalFilePath) {
+	static INT16 recordTracker = 0;
+	INT16 currRecord = recordTracker++;
 	NTSTATUS status;
+	UNICODE_STRING DriveLetter;
 	PFLT_FILE_NAME_INFORMATION FileNameInfo;
+	PWCHAR ProperFileNameStart;
+	INT16 ProperFileNameLenBytes;
 
-	// Retrieve the file name
+	FinalFilePath->Length = 0;
+	// TODO: FltObjects->FileObject->FileName
+
+	// Step 1: Retrieve the Drive Letter
+
+	// Get Drive letter from Device Name
+	// REFER: https://comp.os.ms-windows.programmer.nt.kernel-mode.narkive.com/vvQtO73m/device-name-to-dos-name
+	// 	   subsection link: https://narkive.com/vvQtO73m:7.539.23
+	// REFER: https://stackoverflow.com/questions/15459501/full-file-path-with-drive-letter
+	status = IoVolumeDeviceToDosName(FltObjects->FileObject->DeviceObject, &DriveLetter);
+	if (NT_SUCCESS(status)) {
+		// REFER: https://en.cppreference.com/w/c/string/wide/wcsncpy
+		// REFER: https://docs.microsoft.com/en-us/windows/win32/api/subauth/ns-subauth-unicode_string
+		FinalFilePath->Length = DriveLetter.Length;
+		if (DriveLetter.Buffer != NULL) {
+			wcsncpy(FinalFilePath->Buffer, DriveLetter.Buffer, DriveLetter.Length / sizeof(WCHAR));
+		} else {
+			FinalFilePath->Buffer[0] = L'\0';
+			RtlFreeUnicodeString(&DriveLetter);
+			return status;
+		}
+		// KdPrint(("[%d] GetFileN  [%d] : drive letter = '%ws' %d\r\n", __LINE__, currRecord, DriveLetter.Buffer, DriveLetter.Length));
+		RtlFreeUnicodeString(&DriveLetter);
+	} else if (status == STATUS_INVALID_DEVICE_REQUEST) {
+		// KdPrint(("[%d] GetFileN  [%d] : drive letter = STATUS_INVALID_DEVICE_REQUEST\r\n", __LINE__, currRecord));
+		return status;
+	} else {
+		// KdPrint(("[%d] GetFileN  [%d] : drive letter = error (%x) (%ld)\r\n", __LINE__, currRecord, status, status));
+		return status;
+	}
+
+	// Step 2: Retrieve the File Name
 	// REFER: https://docs.microsoft.com/en-us/windows-hardware/drivers/ifs/flt-file-name-options
-	status = FltGetFileNameInformation(Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_ALWAYS_ALLOW_CACHE_LOOKUP, &FileNameInfo);
-	if (!NT_SUCCESS(status)) return status;
-	
-}*/
+	status = FltGetFileNameInformation(Data, FLT_FILE_NAME_NORMALIZED/* | FLT_FILE_NAME_QUERY_CACHE_ONLY*/, &FileNameInfo);
+	if (NT_SUCCESS(status)) {
+		status = STATUS_ABANDONED;
+		// status = FltParseFileNameInformation(FileNameInfo);
+		if (!NT_SUCCESS(status)) {
+			KdPrint(("[%d] GetFileN  [%d]: ERROR (%x) (%ld) PARSING file name information\r\n", __LINE__, currRecord, status, status));
+			return status;
+		}
+		// For -> FileNameInfo->Name.Buffer = "\Device\HarddiskVolume2\Windows\System32\drivers\FsFilter1.sys"
+		//        FileNameInfo->Name.MaximumLength = 126  <---  2*63  <---  sizeof(WCHAR)*63
+		if (FileNameInfo->Name.Buffer == NULL) {
+			KdPrint(("[%d] GetFileN  [%d]: CRITICAL FileNameInfo->Name.Buffer is NULL, FileNameInfo->Name.Length = %d\r\n", __LINE__, currRecord, FileNameInfo->Name.Length));
+			FinalFilePath->Length = 0;
+			goto l_clean_file_info;
+		}
+		ProperFileNameStart = wcschr(FileNameInfo->Name.Buffer + 1, L'\\');
+		if (ProperFileNameStart == NULL) {
+			KdPrint(("[%d] GetFileN  [%d]: CRITICAL ProperFileNameStart is NULL on 1st search for \"\\\", FileNameInfo->Name.Buffer = \"%ws\"\r\n", __LINE__, currRecord, FileNameInfo->Name.Buffer));
+			FinalFilePath->Length = 0;
+			goto l_clean_file_info;
+		}
+		ProperFileNameStart = wcschr(ProperFileNameStart + 1, L'\\');
+		if (ProperFileNameStart == NULL) {
+			KdPrint(("[%d] GetFileN  [%d]: CRITICAL ProperFileNameStart is NULL on 2nd search for \"\\\", FileNameInfo->Name.Buffer = \"%ws\"\r\n", __LINE__, currRecord, FileNameInfo->Name.Buffer));
+			FinalFilePath->Length = 0;
+			goto l_clean_file_info;
+		}
+		ProperFileNameLenBytes = FileNameInfo->Name.MaximumLength - sizeof(WCHAR) * (ProperFileNameStart - FileNameInfo->Name.Buffer);
+		if ((FinalFilePath->Length + ProperFileNameLenBytes + 1) > FinalFilePath->MaximumLength) {
+			KdPrint(("[%d] GetFileN  [%d]: WARNING Trimming File Path due to VERY HIGH FileNameInfo->Name.MaximumLength = %d\r\n", __LINE__, currRecord, FileNameInfo->Name.MaximumLength));
+			ProperFileNameLenBytes = FinalFilePath->MaximumLength - FinalFilePath->Length - 1;
+		}
+		// REFER: https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-rtlcopymemory
+		RtlCopyMemory(FinalFilePath->Buffer + (FinalFilePath->Length / sizeof(WCHAR)), ProperFileNameStart, ProperFileNameLenBytes);
+		FinalFilePath->Length += ProperFileNameLenBytes;
+		FinalFilePath->Buffer[FinalFilePath->Length / sizeof(WCHAR)] = L'\0';
+
+		l_clean_file_info:
+			{
+				FltReleaseFileNameInformation(FileNameInfo);
+			}
+	} else {
+		// KdPrint(("[%d] GetFileN  [%d]: error (%x) (%ld) GETTING file name information", __LINE__, currRecord, status, status));
+		return status;
+	}
+
+	return STATUS_SUCCESS;
+}
 
 // REFER: https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/irp-mj-create
 FLT_PREOP_CALLBACK_STATUS SssPreCreate(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext) {
@@ -150,87 +234,66 @@ FLT_PREOP_CALLBACK_STATUS SssPreCreate(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OB
 	return FLT_PREOP_SUCCESS_NO_CALLBACK;  // ---> No post - operation callback will never be called
 }
 
+
 // NOTE: IRP_MJ_MDL_READ_COMPLETE is for fast IO
 // NOTE: automatically all drives of a Device are monitored
 FLT_PREOP_CALLBACK_STATUS SssPreRead(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext) {
-	static int recordTracker = 0;
-	int currRecord = recordTracker++;
+	static INT16 recordTracker = 0;
+	static INT16 recordTrackerKernal = 0;
+	INT16 currRecord = recordTracker++;
 	NTSTATUS status;
 	PWCHAR ProperFileNameStart;
-	WCHAR Name[260+5] = { 0 };
+	WCHAR Name[MAX_FILE_PATH_LENGTH] = { 0 };
 	UNICODE_STRING FinalFilePath;
-	UNICODE_STRING DriveLetter;
-	PFLT_FILE_NAME_INFORMATION FileNameInfo;
-	int ErrorDriveLetterAndNameInfo = 0;
-	if (currRecord % 1000) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
-	// TODO: get Drive letter from Device Name
-	// REFER: https://comp.os.ms-windows.programmer.nt.kernel-mode.narkive.com/vvQtO73m/device-name-to-dos-name
-	// 	   subsection link: https://narkive.com/vvQtO73m:7.539.23
-	// REFER: https://stackoverflow.com/questions/15459501/full-file-path-with-drive-letter
+	if (Data->RequestorMode == KernelMode) {
+		KdPrint(("READ: Request from Kernal Mode = %d\r\n", ++recordTrackerKernal));
+		return FLT_PREOP_SUCCESS_NO_CALLBACK;
+	}
+
 	FinalFilePath.Buffer = Name;
-	FinalFilePath.Length = 0;
-	FinalFilePath.MaximumLength = 260+5;
-	
-	status = IoVolumeDeviceToDosName(FltObjects->FileObject->DeviceObject, &DriveLetter);
-	if (NT_SUCCESS(status)) {
-		// REFER: https://en.cppreference.com/w/c/string/wide/wcsncpy
-		// REFER: https://docs.microsoft.com/en-us/windows/win32/api/subauth/ns-subauth-unicode_string
-		FinalFilePath.Length = DriveLetter.Length;
-		if (DriveLetter.Buffer != NULL)
-			wcsncpy(FinalFilePath.Buffer, DriveLetter.Buffer, DriveLetter.Length / sizeof(WCHAR));
-		KdPrint(("Pre READ  [%d] : drive letter = '%ws' %d\r\n", currRecord, DriveLetter.Buffer, DriveLetter.Length));
-		RtlFreeUnicodeString(&DriveLetter);
-	} else if (status == STATUS_INVALID_DEVICE_REQUEST) {
-		KdPrint(("Pre READ  [%d] : drive letter = STATUS_INVALID_DEVICE_REQUEST\r\n", currRecord));
-	} else {
-		KdPrint(("Pre READ  [%d] : drive letter = error %x %ld\r\n", currRecord, status, status));
-		ErrorDriveLetterAndNameInfo |= 1;
-	}
-	// Retrieve the file name
-	// REFER: https://docs.microsoft.com/en-us/windows-hardware/drivers/ifs/flt-file-name-options
-	status = FltGetFileNameInformation(Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_ALWAYS_ALLOW_CACHE_LOOKUP, &FileNameInfo);
-	if (NT_SUCCESS(status)) {
-		status = FltParseFileNameInformation(FileNameInfo);
-		if (NT_SUCCESS(status)) {
-			if (FileNameInfo->Name.MaximumLength < 260) {
-				// For FileNameInfo->Name.Buffer = "\Device\HarddiskVolume2\Windows\System32\drivers\FsFilter1.sys"
-				// FileNameInfo->Name.MaximumLength = 126  <---  2*63  <---  sizeof(WCHAR)*63
-				ProperFileNameStart = wcschr(wcschr(FileNameInfo->Name.Buffer + 1, L'\\') + 1, L'\\');
-				FinalFilePath.MaximumLength = FileNameInfo->Name.MaximumLength - sizeof(WCHAR) * (ProperFileNameStart - FileNameInfo->Name.Buffer);
-				// REFER: https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-rtlcopymemory
-				RtlCopyMemory(FinalFilePath.Buffer + (FinalFilePath.Length / sizeof(WCHAR)), ProperFileNameStart, FinalFilePath.MaximumLength);
-				FinalFilePath.Length += FinalFilePath.MaximumLength;
-				FinalFilePath.MaximumLength = 265;
-				FinalFilePath.Buffer[FinalFilePath.Length / sizeof(WCHAR)] = L'\0';
-				// REFER: https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/strupr-strupr-l-mbsupr-mbsupr-l-wcsupr-l-wcsupr?view=msvc-160
-				// _wcsupr(Name);  // if we have uppercase and lowercase character, then we always change this file name to uppercase
-				// REFER: https://en.cppreference.com/w/c/string/wide/wcsstr
-				KdPrint(("Pre READ  [%d] FinalFilePath.Buffer = %ws\r\n", currRecord, FinalFilePath.Buffer));
-				KdPrint(("Pre READ  [%d] FileNameInfo->Name.MaximumLength = %d\r\n", currRecord, FileNameInfo->Name.MaximumLength));
-				if (wcsstr(FinalFilePath.Buffer, L"openme.txt") != NULL) {
-					// Block the IO request
-					KdPrint(("Pre READ  [%d] (BLOCKED) file: %ws\r\n", currRecord, Name));
-					Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-					// since we blocked the IRP write operation, the real transferring size is 0
-					Data->IoStatus.Information = 0;
-					FltReleaseFileNameInformation(FileNameInfo);
-					return FLT_PREOP_COMPLETE;  // on seeing this return value, the filter manager will never pass this IRP down to the driver below us
-				}
-				if (wcsstr(Name, L"dbgview_fm_") == NULL)
-					KdPrint(("Pre READ  [%d] file: %ws\r\n", currRecord, Name));
-			}
-		} else {
-			KdPrint(("Pre READ  [%d]: error %x %ld PARSING file name information", currRecord, status, status));
+	FinalFilePath.MaximumLength = MAX_FILE_PATH_LENGTH;
+
+	status = MGetFileName(Data, FltObjects, &FinalFilePath);
+	if (NT_SUCCESS(status) && FinalFilePath.Length != 0) {
+		// REFER: https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/strupr-strupr-l-mbsupr-mbsupr-l-wcsupr-l-wcsupr?view=msvc-160
+		// _wcsupr(Name);  // if we have uppercase and lowercase character, then we always change this file name to uppercase
+		// REFER: https://en.cppreference.com/w/c/string/wide/wcsstr
+		// KdPrint(("[%d] PreRead   [%d] FinalFilePath->Buffer = %ws\r\n", __LINE__, currRecord, FinalFilePath.Buffer));
+		// TODO: enforce the filter rules over here
+		// if (MApplyFilterRules(&FinalFilePath)) {}
+		// if (wcsstr(Name, L"dbgview_fm_") == NULL)
+			KdPrint(("[%d] PreRead   [%d] file: %ws\r\n", __LINE__, currRecord, Name));
+		if (wcsstr(FinalFilePath.Buffer, L"openme.txt") != NULL) {
+			// Block the IO request
+			KdPrint(("[%d] PreRead   [%d] (BLOCKED) file: %ws\r\n", __LINE__, currRecord, Name));
+			Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+			// since we blocked the IRP write operation, the real transferring size is 0
+			Data->IoStatus.Information = 0;
+			return FLT_PREOP_COMPLETE;  // on seeing this return value, the filter manager will never pass this IRP down to the driver below us
 		}
-		FltReleaseFileNameInformation(FileNameInfo);
-	} else {
-		KdPrint(("Pre READ  [%d]: error %x %ld GETTING file name information", currRecord, status, status));
-		ErrorDriveLetterAndNameInfo |= 2;
 	}
-	if (ErrorDriveLetterAndNameInfo == 1) {
-		KdPrint(("Pre READ  [%d]: WARNING only single ERROR %d", currRecord, ErrorDriveLetterAndNameInfo));
-	}
+
+	// This means that we have NO post-operation
+	// callback to be called
+	return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+
+// NOTE: IRP_MJ_MDL_READ_COMPLETE is for fast IO
+// NOTE: automatically all drives of a Device are monitored
+FLT_PREOP_CALLBACK_STATUS SssPreReadSimple(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext) {
+	static INT16 recordTracker = 0;
+	INT16 currRecord = recordTracker++;
+
+	//if (currRecord % 100 == 0)
+		KdPrint(("Read num = %d\r\n", currRecord));
+
+	// TODO: get PID
+	// REFER: https://community.osr.com/discussion/137962
+	// procid = PsGetCurrentProcessId();
+	// peproc = PsGetCurrentProcess();
+	// pImageName = PsGetProcessImageFileName(peproc);
 
 	// This means that we have NO post-operation
 	// callback to be called
@@ -240,15 +303,19 @@ FLT_PREOP_CALLBACK_STATUS SssPreRead(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJE
 
 // NOTE: automatically all drives of a Device are monitored
 FLT_PREOP_CALLBACK_STATUS SssPreWrite(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext) {
-	static int recordTracker = 0;
-	int currRecord = recordTracker++;
+	static INT16 recordTracker = 0;
+	static INT16 recordTrackerKernal = 0;
+	INT16 currRecord = recordTracker++;
 	NTSTATUS status;
 	WCHAR Name[260] = { 0 };
 	UNICODE_STRING DriveLetter;
 	PFLT_FILE_NAME_INFORMATION FileNameInfo;
 	int ErrorDriveLetterAndNameInfo = 0;
-	if (currRecord % 1000) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
+	if (Data->RequestorMode == KernelMode) {
+		KdPrint(("WRITE: Request from Kernal Mode = %d\r\n", ++recordTrackerKernal));
+		return FLT_PREOP_SUCCESS_NO_CALLBACK;
+	}
 	// TODO: load rules from CSV file
 	// REFER: https://stackoverflow.com/questions/1976007/what-characters-are-forbidden-in-windows-and-linux-directory-names
 		// Forward slash is the best separator "/"
@@ -272,7 +339,7 @@ FLT_PREOP_CALLBACK_STATUS SssPreWrite(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJ
 	// REFER: https://comp.os.ms-windows.programmer.nt.kernel-mode.narkive.com/vvQtO73m/device-name-to-dos-name
 	// 	   subsection link: https://narkive.com/vvQtO73m:7.539.23
 	// REFER: https://stackoverflow.com/questions/15459501/full-file-path-with-drive-letter
-	
+
 	status = IoVolumeDeviceToDosName(FltObjects->FileObject->DeviceObject, &DriveLetter);
 	if (NT_SUCCESS(status)) {
 		KdPrint(("Pre WRITE [%d] : drive letter = '%ws'\r\n", currRecord, DriveLetter.Buffer));
@@ -280,7 +347,7 @@ FLT_PREOP_CALLBACK_STATUS SssPreWrite(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJ
 	} else if (status == STATUS_INVALID_DEVICE_REQUEST) {
 		KdPrint(("Pre WRITE [%d] : drive letter = STATUS_INVALID_DEVICE_REQUEST\r\n", currRecord));
 	} else {
-		KdPrint(("Pre WRITE [%d] : drive letter = error %x %ld", currRecord, status, status));
+		KdPrint(("Pre WRITE [%d] : drive letter = error %x %ld\r\n", currRecord, status, status));
 		ErrorDriveLetterAndNameInfo |= 1;
 	}
 	// Retrieve the file name
@@ -310,11 +377,11 @@ FLT_PREOP_CALLBACK_STATUS SssPreWrite(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJ
 		}
 		FltReleaseFileNameInformation(FileNameInfo);
 	} else {
-		KdPrint(("Pre WRITE [%d]: error %x %ld GETTING file name information", currRecord, status, status));
+		KdPrint(("Pre WRITE [%d]: error %x %ld GETTING file name information\r\n", currRecord, status, status));
 		ErrorDriveLetterAndNameInfo |= 2;
 	}
 	if (ErrorDriveLetterAndNameInfo == 1) {
-		KdPrint(("Pre WRITE [%d]: WARNING only single ERROR %d", currRecord, ErrorDriveLetterAndNameInfo));
+		KdPrint(("Pre WRITE [%d]: WARNING only single ERROR %d\r\n", currRecord, ErrorDriveLetterAndNameInfo));
 	}
 
 	// This means that we have NO post-operation
